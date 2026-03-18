@@ -24,6 +24,13 @@ import com.pi.ai.core.types.TextContent;
 import com.pi.ai.core.types.ThinkingBudgets;
 import com.pi.ai.core.types.Transport;
 import com.pi.ai.core.types.UserMessage;
+import com.pi.ai.core.types.AssistantMessage;
+import com.pi.ai.core.types.StopReason;
+import com.pi.ai.core.types.Usage;
+import com.pi.ai.core.event.EventStream;
+import com.pi.agent.config.AgentLoopConfig;
+import com.pi.agent.loop.AgentLoop;
+import com.pi.agent.types.AgentContext;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -806,21 +813,213 @@ public class Agent {
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // Internal loop management (placeholder for Task 10.8)
+    // Internal loop management (Req 31)
     // ─────────────────────────────────────────────────────────────────────────────
 
     /**
      * Internal method to run the agent loop.
      *
-     * <p>This is a placeholder that will be fully implemented in Task 10.8.
+     * <p>Creates a CancellationSignal, sets isStreaming=true, builds AgentContext,
+     * and delegates to AgentLoop.agentLoop or AgentLoop.agentLoopContinue.
+     *
+     * <p>On normal completion, cleans up state. On exception, creates an error
+     * AssistantMessage and emits agent_end. The finally block always executes
+     * state cleanup.
+     *
+     * <p><b>Validates: Requirements 31.1, 31.2, 31.3, 31.4, 31.5, 41.4, 41.5</b>
      *
      * @param prompts the messages to send as prompts (empty for continue mode)
      * @param continueMode true if continuing from existing context, false for new prompts
      * @return a future that completes when the loop finishes
      */
     CompletableFuture<Void> _runLoop(List<AgentMessage> prompts, boolean continueMode) {
-        // Placeholder implementation - will be fully implemented in Task 10.8
-        // For now, just return a completed future
-        return CompletableFuture.completedFuture(null);
+        // Create CancellationSignal (Req 31.1)
+        CancellationSignal newSignal = new CancellationSignal();
+        this.signal = newSignal;
+
+        // Set isStreaming = true (Req 31.1)
+        state.setIsStreaming(true);
+
+        // Clear error state
+        state.setError(null);
+
+        // Create the running promise
+        CompletableFuture<Void> promise = new CompletableFuture<>();
+        this.runningPromise = promise;
+
+        // Run the loop asynchronously
+        CompletableFuture.runAsync(() -> {
+            try {
+                // Build AgentContext from current state (Req 31.2)
+                AgentContext context = AgentContext.builder()
+                        .systemPrompt(state.getSystemPrompt())
+                        .messages(new ArrayList<>(state.getMessages()))
+                        .tools(state.getTools())
+                        .build();
+
+                // Build AgentLoopConfig from current configuration (Req 31.2)
+                Model model = state.getModel();
+                AgentLoopConfig config = AgentLoopConfig.builder()
+                        .model(model)
+                        .convertToLlm(convertToLlm)
+                        .transformContext(transformContext)
+                        .getApiKey(getApiKey)
+                        .getSteeringMessages(this::dequeueSteeringMessagesAsync)
+                        .getFollowUpMessages(this::dequeueFollowUpMessagesAsync)
+                        .toolExecution(toolExecution)
+                        .beforeToolCall(beforeToolCall)
+                        .afterToolCall(afterToolCall)
+                        .sessionId(sessionId)
+                        .transport(transport)
+                        .maxRetryDelayMs(maxRetryDelayMs)
+                        .onPayload(onPayload)
+                        .thinkingBudgets(thinkingBudgets)
+                        .reasoning(state.getThinkingLevel() != null
+                                ? state.getThinkingLevel().toPiAiThinkingLevel()
+                                : null)
+                        .build();
+
+                // Call AgentLoop.agentLoop or AgentLoop.agentLoopContinue based on continueMode
+                EventStream<AgentEvent, List<AgentMessage>> eventStream;
+                if (continueMode) {
+                    eventStream = AgentLoop.agentLoopContinue(context, config, newSignal, streamFn);
+                } else {
+                    eventStream = AgentLoop.agentLoop(prompts, context, config, newSignal, streamFn);
+                }
+
+                // Iterate over EventStream, calling _processLoopEvent for each event
+                for (AgentEvent event : eventStream) {
+                    _processLoopEvent(event);
+                }
+
+                // Normal completion - sync messages from context back to state (Req 31.3)
+                state.setMessages(new ArrayList<>(context.getMessages()));
+
+            } catch (Exception e) {
+                // On exception, create error AssistantMessage and emit agent_end (Req 31.4, 41.4, 41.5)
+                Model model = state.getModel();
+                StopReason stopReason = (newSignal.isCancelled())
+                        ? StopReason.ABORTED
+                        : StopReason.ERROR;
+
+                AssistantMessage errorMsg = AssistantMessage.builder()
+                        .content(List.of(new TextContent("")))
+                        .api(model != null ? model.api() : null)
+                        .provider(model != null ? model.provider() : null)
+                        .model(model != null ? model.id() : null)
+                        .usage(createEmptyUsage())
+                        .stopReason(stopReason)
+                        .errorMessage(e.getMessage())
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+
+                AgentMessage wrappedErrorMsg = MessageAdapter.wrap(errorMsg);
+                appendMessage(wrappedErrorMsg);
+                state.setError(e.getMessage());
+                emit(new AgentEvent.AgentEnd(List.of(wrappedErrorMsg)));
+
+            } finally {
+                // finally block always executes state cleanup (Req 31.5)
+                state.setIsStreaming(false);
+                state.setStreamMessage(null);
+                state.setPendingToolCalls(new CopyOnWriteArraySet<>());
+                this.signal = null;
+
+                // Complete the running promise
+                promise.complete(null);
+            }
+        });
+
+        return promise;
+    }
+
+    /**
+     * Creates an empty Usage instance for error messages.
+     */
+    private Usage createEmptyUsage() {
+        return new Usage(0, 0, 0, 0, 0, new Usage.Cost(0.0, 0.0, 0.0, 0.0, 0.0));
+    }
+
+    /**
+     * Async wrapper for dequeueSteeringMessages for use with AgentLoopConfig.
+     */
+    private CompletableFuture<List<AgentMessage>> dequeueSteeringMessagesAsync() {
+        return CompletableFuture.completedFuture(dequeueSteeringMessages());
+    }
+
+    /**
+     * Async wrapper for dequeueFollowUpMessages for use with AgentLoopConfig.
+     */
+    private CompletableFuture<List<AgentMessage>> dequeueFollowUpMessagesAsync() {
+        return CompletableFuture.completedFuture(dequeueFollowUpMessages());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Internal event processing (Req 32)
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Processes a single event from the agent loop, updating internal state
+     * and dispatching to all listeners.
+     *
+     * <p>State transitions:
+     * <ul>
+     *   <li>{@code message_start} → streamMessage = event.message</li>
+     *   <li>{@code message_update} → streamMessage = event.message</li>
+     *   <li>{@code message_end} → streamMessage = null, messages.add(event.message)</li>
+     *   <li>{@code tool_execution_start} → pendingToolCalls.add(event.toolCallId)</li>
+     *   <li>{@code tool_execution_end} → pendingToolCalls.remove(event.toolCallId)</li>
+     *   <li>{@code turn_end} → if message is AssistantMessage with errorMessage, set error</li>
+     *   <li>{@code agent_end} → isStreaming = false, streamMessage = null</li>
+     * </ul>
+     *
+     * <p>After state update, calls emit(event) to dispatch to all listeners.
+     *
+     * <p><b>Validates: Requirements 32.1, 32.2, 32.3, 32.4, 32.5, 32.6, 32.7</b>
+     *
+     * @param event the event to process
+     */
+    void _processLoopEvent(AgentEvent event) {
+        // Update state based on event type (using if-else instanceof for Java 17 compatibility)
+        if (event instanceof AgentEvent.MessageStart messageStart) {
+            // Req 32.1: message_start → streamMessage = message
+            state.setStreamMessage(messageStart.message());
+
+        } else if (event instanceof AgentEvent.MessageUpdate messageUpdate) {
+            // Req 32.2: message_update → streamMessage = message
+            state.setStreamMessage(messageUpdate.message());
+
+        } else if (event instanceof AgentEvent.MessageEnd messageEnd) {
+            // Req 32.3: message_end → streamMessage = null, messages.add(message)
+            state.setStreamMessage(null);
+            state.getMessages().add(messageEnd.message());
+
+        } else if (event instanceof AgentEvent.ToolExecutionStart toolStart) {
+            // Req 32.4: tool_execution_start → pendingToolCalls.add(toolCallId)
+            state.addPendingToolCall(toolStart.toolCallId());
+
+        } else if (event instanceof AgentEvent.ToolExecutionEnd toolEnd) {
+            // Req 32.5: tool_execution_end → pendingToolCalls.remove(toolCallId)
+            state.removePendingToolCall(toolEnd.toolCallId());
+
+        } else if (event instanceof AgentEvent.TurnEnd turnEnd) {
+            // Check if message is AssistantMessage with errorMessage, set error
+            AgentMessage message = turnEnd.message();
+            if (message instanceof MessageAdapter adapter
+                    && adapter.message() instanceof AssistantMessage assistantMsg) {
+                String errorMessage = assistantMsg.getErrorMessage();
+                if (errorMessage != null && !errorMessage.isEmpty()) {
+                    state.setError(errorMessage);
+                }
+            }
+
+        } else if (event instanceof AgentEvent.AgentEnd) {
+            // Req 32.6: agent_end → isStreaming = false, streamMessage = null
+            state.setIsStreaming(false);
+            state.setStreamMessage(null);
+        }
+
+        // Req 32.7: After state update, dispatch event to all listeners
+        emit(event);
     }
 }
