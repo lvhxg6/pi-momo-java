@@ -45,6 +45,19 @@ public class SimpleStreamOptions extends StreamOptions {
         this.thinkingBudgets = builder.thinkingBudgets;
     }
 
+    /**
+     * 子类 Builder 构造器，供子类（如 ProxyStreamOptions）继承扩展。
+     *
+     * @param builder 子类 Builder 实例
+     * @param reasoning 思考级别
+     * @param thinkingBudgets 思考 token 预算
+     */
+    protected SimpleStreamOptions(AbstractBuilder<?> builder, ThinkingLevel reasoning, ThinkingBudgets thinkingBudgets) {
+        super(builder);
+        this.reasoning = reasoning;
+        this.thinkingBudgets = thinkingBudgets;
+    }
+
     // --- Getters ---
 
     public ThinkingLevel getReasoning() {
