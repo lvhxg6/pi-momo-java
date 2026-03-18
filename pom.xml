@@ -17,6 +17,7 @@
         <module>pi-agent-core</module>
         <module>pi-ai-providers</module>
         <module>pi-ai-oauth</module>
+        <module>pi-coding-agent</module>
     </modules>
 
     <properties>
