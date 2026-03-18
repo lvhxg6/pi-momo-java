@@ -32,6 +32,11 @@ import com.pi.ai.core.types.ToolResultMessage;
 import com.pi.ai.core.util.PiAiJson;
 import com.pi.ai.core.util.ToolValidator;
 
+import com.pi.agent.config.AfterToolCallHook;
+import com.pi.agent.types.AfterToolCallContext;
+import com.pi.agent.types.AfterToolCallResult;
+import com.pi.agent.types.ToolExecutionMode;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -510,10 +515,11 @@ public final class AgentLoop {
     /**
      * Executes tool calls from an assistant message.
      *
-     * <p><b>Stub</b>: Tasks 7.5-7.8 will implement the full logic including
-     * executePreparedToolCall, finalizeExecutedToolCall,
-     * and sequential/parallel execution modes.
-     * For now, returns an empty list (no tool results).
+     * <p>Extracts tool calls from the assistant message and dispatches to either
+     * {@link #executeToolCallsSequential} or {@link #executeToolCallsParallel}
+     * based on the configured {@link ToolExecutionMode}.
+     *
+     * <p><b>Validates: Requirements 18.1, 18.2, 18.3, 18.4, 19.1, 19.2, 19.3, 19.4, 19.5</b>
      */
     static List<ToolResultMessage> executeToolCalls(
             AgentContext context,
@@ -522,8 +528,252 @@ public final class AgentLoop {
             CancellationSignal signal,
             EventStream<AgentEvent, List<AgentMessage>> stream) {
 
-        // Stub: return empty results. Tasks 7.5-7.8 will implement full tool execution.
-        return List.of();
+        // Extract tool calls from assistant message
+        List<ToolCall> toolCalls = extractToolCalls(assistantMessage);
+        if (toolCalls.isEmpty()) {
+            return List.of();
+        }
+
+        // Dispatch based on tool execution mode (default is PARALLEL)
+        ToolExecutionMode mode = config.getToolExecution();
+        if (mode == ToolExecutionMode.SEQUENTIAL) {
+            return executeToolCallsSequential(context, assistantMessage, toolCalls, config, signal, stream);
+        } else {
+            return executeToolCallsParallel(context, assistantMessage, toolCalls, config, signal, stream);
+        }
+    }
+
+    /**
+     * Executes tool calls sequentially: prepare → execute → finalize for each tool call.
+     *
+     * <p>For each tool call:
+     * <ol>
+     *   <li>Emit {@code tool_execution_start}</li>
+     *   <li>Prepare the tool call</li>
+     *   <li>If Immediate: emit events and add result directly</li>
+     *   <li>If Prepared: execute, then finalize</li>
+     * </ol>
+     *
+     * <p><b>Validates: Requirements 18.1, 18.2, 18.3, 18.4</b>
+     */
+    static List<ToolResultMessage> executeToolCallsSequential(
+            AgentContext context,
+            AgentMessage assistantMessage,
+            List<ToolCall> toolCalls,
+            AgentLoopConfig config,
+            CancellationSignal signal,
+            EventStream<AgentEvent, List<AgentMessage>> stream) {
+
+        List<ToolResultMessage> results = new ArrayList<>();
+
+        for (ToolCall toolCall : toolCalls) {
+            // Emit tool_execution_start (Req 18.1)
+            stream.push(new AgentEvent.ToolExecutionStart(
+                    toolCall.id(), toolCall.name(), toolCall.arguments()));
+
+            // Prepare the tool call (Req 18.2)
+            PrepareResult preparation = prepareToolCall(context, assistantMessage, toolCall, config, signal);
+
+            if (preparation instanceof PrepareResult.Immediate immediate) {
+                // Immediate result: emit events and add result directly (Req 18.3)
+                stream.push(new AgentEvent.ToolExecutionEnd(
+                        toolCall.id(), toolCall.name(), immediate.result(), immediate.isError()));
+
+                ToolResultMessage toolResultMsg = buildToolResultMessage(
+                        toolCall.id(), toolCall.name(), immediate.result(), immediate.isError());
+                stream.push(new AgentEvent.MessageStart(MessageAdapter.wrap(toolResultMsg)));
+                stream.push(new AgentEvent.MessageEnd(MessageAdapter.wrap(toolResultMsg)));
+                results.add(toolResultMsg);
+
+            } else if (preparation instanceof PrepareResult.Prepared prepared) {
+                // Execute and finalize (Req 18.4)
+                ExecuteResult executed = executePreparedToolCall(prepared, signal, stream);
+                ToolResultMessage toolResultMsg = finalizeExecutedToolCall(
+                        context, assistantMessage, prepared, executed, config, signal, stream);
+                results.add(toolResultMsg);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Executes tool calls in parallel with three phases:
+     * <ol>
+     *   <li>Phase 1 (prepare): Sequentially prepare each tool call, emit {@code tool_execution_start}</li>
+     *   <li>Phase 2 (execute): Concurrently execute all Prepared tools using {@code CompletableFuture.supplyAsync}</li>
+     *   <li>Phase 3 (finalize): Join and finalize in original tool call order</li>
+     * </ol>
+     *
+     * <p><b>Validates: Requirements 19.1, 19.2, 19.3, 19.4, 19.5</b>
+     */
+    static List<ToolResultMessage> executeToolCallsParallel(
+            AgentContext context,
+            AgentMessage assistantMessage,
+            List<ToolCall> toolCalls,
+            AgentLoopConfig config,
+            CancellationSignal signal,
+            EventStream<AgentEvent, List<AgentMessage>> stream) {
+
+        // Phase 1: Sequential prepare (Req 19.1)
+        List<PrepareResultEntry> preparedCalls = new ArrayList<>();
+        for (ToolCall toolCall : toolCalls) {
+            // Emit tool_execution_start
+            stream.push(new AgentEvent.ToolExecutionStart(
+                    toolCall.id(), toolCall.name(), toolCall.arguments()));
+
+            PrepareResult preparation = prepareToolCall(context, assistantMessage, toolCall, config, signal);
+            preparedCalls.add(new PrepareResultEntry(toolCall, preparation));
+        }
+
+        // Phase 2: Parallel execute (Req 19.2, 19.3)
+        List<RunningCallEntry> runningCalls = new ArrayList<>();
+        for (PrepareResultEntry entry : preparedCalls) {
+            if (entry.preparation() instanceof PrepareResult.Prepared prepared) {
+                CompletableFuture<ExecuteResult> future = CompletableFuture.supplyAsync(() ->
+                        executePreparedToolCall(prepared, signal, stream));
+                runningCalls.add(new RunningCallEntry(entry.toolCall(), prepared, future));
+            }
+        }
+
+        // Phase 3: Finalize in original order (Req 19.4, 19.5)
+        List<ToolResultMessage> results = new ArrayList<>();
+        int runningIndex = 0;
+
+        for (PrepareResultEntry entry : preparedCalls) {
+            if (entry.preparation() instanceof PrepareResult.Immediate immediate) {
+                // Handle immediate result
+                stream.push(new AgentEvent.ToolExecutionEnd(
+                        entry.toolCall().id(), entry.toolCall().name(),
+                        immediate.result(), immediate.isError()));
+
+                ToolResultMessage toolResultMsg = buildToolResultMessage(
+                        entry.toolCall().id(), entry.toolCall().name(),
+                        immediate.result(), immediate.isError());
+                stream.push(new AgentEvent.MessageStart(MessageAdapter.wrap(toolResultMsg)));
+                stream.push(new AgentEvent.MessageEnd(MessageAdapter.wrap(toolResultMsg)));
+                results.add(toolResultMsg);
+
+            } else if (entry.preparation() instanceof PrepareResult.Prepared) {
+                // Find the corresponding running call and join
+                RunningCallEntry running = runningCalls.get(runningIndex++);
+                ExecuteResult executed = running.future().join();
+                ToolResultMessage toolResultMsg = finalizeExecutedToolCall(
+                        context, assistantMessage, running.prepared(), executed, config, signal, stream);
+                results.add(toolResultMsg);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Entry for tracking prepare results with their original tool calls.
+     */
+    private record PrepareResultEntry(ToolCall toolCall, PrepareResult preparation) {}
+
+    /**
+     * Entry for tracking running tool executions.
+     */
+    private record RunningCallEntry(ToolCall toolCall, PrepareResult.Prepared prepared,
+                                    CompletableFuture<ExecuteResult> future) {}
+
+    /**
+     * Finalizes an executed tool call by applying AfterToolCallHook and emitting events.
+     *
+     * <p>Steps:
+     * <ol>
+     *   <li>Call AfterToolCallHook if configured (field-level merge)</li>
+     *   <li>Emit {@code tool_execution_end}</li>
+     *   <li>Build {@link ToolResultMessage}</li>
+     *   <li>Emit {@code message_start} and {@code message_end}</li>
+     * </ol>
+     *
+     * <p><b>Validates: Requirements 22.1, 22.2, 22.3, 22.4, 22.5</b>
+     */
+    static ToolResultMessage finalizeExecutedToolCall(
+            AgentContext context,
+            AgentMessage assistantMsg,
+            PrepareResult.Prepared prepared,
+            ExecuteResult executed,
+            AgentLoopConfig config,
+            CancellationSignal signal,
+            EventStream<AgentEvent, List<AgentMessage>> stream) {
+
+        AgentToolResult<?> result = executed.result();
+        boolean isError = executed.isError();
+
+        // Call AfterToolCallHook if configured (Req 22.1, 22.2)
+        AfterToolCallHook afterHook = config.getAfterToolCall();
+        if (afterHook != null) {
+            // Extract AssistantMessage from AgentMessage via MessageAdapter
+            AssistantMessage assistantMessage = null;
+            if (assistantMsg instanceof MessageAdapter adapter
+                    && adapter.message() instanceof AssistantMessage am) {
+                assistantMessage = am;
+            }
+
+            if (assistantMessage != null) {
+                AfterToolCallContext afterContext = new AfterToolCallContext(
+                        assistantMessage,
+                        prepared.toolCall(),
+                        prepared.args(),
+                        result,
+                        isError,
+                        context);
+
+                try {
+                    AfterToolCallResult afterResult = afterHook.call(afterContext, signal).join();
+
+                    // Field-level merge: non-null fields override (Req 22.2)
+                    if (afterResult != null) {
+                        if (afterResult.content() != null) {
+                            result = new AgentToolResult<>(afterResult.content(), result.details());
+                        }
+                        if (afterResult.details() != null) {
+                            result = new AgentToolResult<>(result.content(), afterResult.details());
+                        }
+                        if (afterResult.isError() != null) {
+                            isError = afterResult.isError();
+                        }
+                    }
+                } catch (Exception e) {
+                    // AfterToolCallHook failure: keep original result
+                }
+            }
+        }
+
+        // Emit tool_execution_end (Req 22.3)
+        stream.push(new AgentEvent.ToolExecutionEnd(
+                prepared.toolCall().id(), prepared.tool().name(), result, isError));
+
+        // Build ToolResultMessage (Req 22.4)
+        ToolResultMessage toolResultMessage = buildToolResultMessage(
+                prepared.toolCall().id(), prepared.tool().name(), result, isError);
+
+        // Emit message_start/message_end (Req 22.5)
+        AgentMessage wrappedResult = MessageAdapter.wrap(toolResultMessage);
+        stream.push(new AgentEvent.MessageStart(wrappedResult));
+        stream.push(new AgentEvent.MessageEnd(wrappedResult));
+
+        return toolResultMessage;
+    }
+
+    /**
+     * Builds a {@link ToolResultMessage} from tool execution result.
+     */
+    private static ToolResultMessage buildToolResultMessage(
+            String toolCallId,
+            String toolName,
+            AgentToolResult<?> result,
+            boolean isError) {
+        return new ToolResultMessage(
+                toolCallId,
+                toolName,
+                result.content(),
+                result.details(),
+                isError,
+                System.currentTimeMillis());
     }
 
     // ── Tool preparation ─────────────────────────────────────────────────
