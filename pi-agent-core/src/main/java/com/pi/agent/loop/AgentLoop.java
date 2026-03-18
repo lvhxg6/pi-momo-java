@@ -1,5 +1,6 @@
 package com.pi.agent.loop;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.pi.agent.config.AgentLoopConfig;
 import com.pi.agent.config.BeforeToolCallHook;
 import com.pi.agent.config.ConvertToLlmFunction;
@@ -9,6 +10,7 @@ import com.pi.agent.types.AgentContext;
 import com.pi.agent.types.AgentMessage;
 import com.pi.agent.types.AgentTool;
 import com.pi.agent.types.AgentToolResult;
+import com.pi.agent.types.AgentToolUpdateCallback;
 import com.pi.agent.types.BeforeToolCallContext;
 import com.pi.agent.types.BeforeToolCallResult;
 import com.pi.agent.types.MessageAdapter;
@@ -27,6 +29,7 @@ import com.pi.ai.core.types.TextContent;
 import com.pi.ai.core.types.Tool;
 import com.pi.ai.core.types.ToolCall;
 import com.pi.ai.core.types.ToolResultMessage;
+import com.pi.ai.core.util.PiAiJson;
 import com.pi.ai.core.util.ToolValidator;
 
 import java.util.ArrayList;
@@ -606,6 +609,63 @@ public final class AgentLoop {
 
         // 4. All checks passed (Req 20.7)
         return new PrepareResult.Prepared(toolCall, tool, toolCall.arguments());
+    }
+
+    // ── Tool execution ──────────────────────────────────────────────────
+
+    /**
+     * Executes a prepared tool call by invoking the tool's {@code execute} method.
+     *
+     * <p>Creates an {@code onUpdate} callback that emits
+     * {@link AgentEvent.ToolExecutionUpdate} events via the stream for each
+     * partial result reported by the tool during execution.
+     *
+     * <p>On success, returns the tool result with {@code isError=false}.
+     * On exception, captures the error message and returns an error
+     * {@link AgentToolResult} with {@code isError=true}.
+     *
+     * <p><b>Validates: Requirements 21.1, 21.2, 21.3, 21.4</b>
+     *
+     * @param prepared the prepared tool call (toolCall, tool, args)
+     * @param signal   optional cancellation signal
+     * @param stream   the event stream to emit tool_execution_update events
+     * @return an {@link ExecuteResult} containing the tool result and error flag
+     */
+    static ExecuteResult executePreparedToolCall(
+            PrepareResult.Prepared prepared,
+            CancellationSignal signal,
+            EventStream<AgentEvent, List<AgentMessage>> stream) {
+
+        // Create onUpdate callback that emits tool_execution_update events (Req 21.2)
+        AgentToolUpdateCallback onUpdate = (partialResult) -> {
+            stream.push(new AgentEvent.ToolExecutionUpdate(
+                    prepared.toolCall().id(),
+                    prepared.tool().name(),
+                    prepared.args(),
+                    partialResult));
+        };
+
+        try {
+            // Convert args Object to JsonNode for AgentTool.execute (Req 21.1)
+            JsonNode argsAsJsonNode = PiAiJson.MAPPER.valueToTree(prepared.args());
+
+            // Call AgentTool.execute and block for result (Req 21.1)
+            AgentToolResult<?> result = prepared.tool()
+                    .execute(prepared.toolCall().id(), argsAsJsonNode, signal, onUpdate)
+                    .join();
+
+            // Req 21.3: successful execution
+            return new ExecuteResult(result, false);
+        } catch (Exception e) {
+            // Req 21.4: capture exception and return error result
+            String errorMessage = e.getMessage() != null ? e.getMessage() : "Tool execution failed";
+            // Unwrap CompletionException to get the root cause message
+            Throwable cause = e.getCause();
+            if (cause != null && cause.getMessage() != null) {
+                errorMessage = cause.getMessage();
+            }
+            return new ExecuteResult(createErrorToolResult(errorMessage), true);
+        }
     }
 
     /**
