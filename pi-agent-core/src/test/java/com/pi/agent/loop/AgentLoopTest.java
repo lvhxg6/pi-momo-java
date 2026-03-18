@@ -248,9 +248,11 @@ class AgentLoopTest {
         List<AgentEvent> events = collectEvents(stream);
 
         // After agent_start and turn_start, there should be no message_start/end
-        // for the existing user message (only turn_end and agent_end from the stub)
+        // for the existing user message. However, the runLoop will produce a stub
+        // assistant message which does emit message_start/end.
         long messageStartCount = events.stream()
-                .filter(e -> e instanceof AgentEvent.MessageStart)
+                .filter(e -> e instanceof AgentEvent.MessageStart ms
+                        && "user".equals(ms.message().role()))
                 .count();
         assertThat(messageStartCount).isZero();
     }
@@ -269,7 +271,7 @@ class AgentLoopTest {
     }
 
     @Test
-    void agentLoopContinue_resultIsEmptyNewMessages() {
+    void agentLoopContinue_resultContainsAssistantMessage() {
         AgentContext ctx = emptyContext();
         ctx.getMessages().add(stubMessage("user"));
 
@@ -278,9 +280,10 @@ class AgentLoopTest {
 
         collectEvents(stream);
 
-        // In continue mode with stub runLoop, no new messages are produced
+        // In continue mode, runLoop produces a stub assistant message
         List<AgentMessage> result = stream.result().join();
-        assertThat(result).isEmpty();
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).role()).isEqualTo("assistant");
     }
 
     @Test
