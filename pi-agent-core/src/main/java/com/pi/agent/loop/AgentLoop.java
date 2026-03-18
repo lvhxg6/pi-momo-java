@@ -1,12 +1,16 @@
 package com.pi.agent.loop;
 
 import com.pi.agent.config.AgentLoopConfig;
+import com.pi.agent.config.BeforeToolCallHook;
 import com.pi.agent.config.ConvertToLlmFunction;
 import com.pi.agent.config.StreamFn;
 import com.pi.agent.event.AgentEvent;
 import com.pi.agent.types.AgentContext;
 import com.pi.agent.types.AgentMessage;
 import com.pi.agent.types.AgentTool;
+import com.pi.agent.types.AgentToolResult;
+import com.pi.agent.types.BeforeToolCallContext;
+import com.pi.agent.types.BeforeToolCallResult;
 import com.pi.agent.types.MessageAdapter;
 import com.pi.ai.core.event.AssistantMessageEvent;
 import com.pi.ai.core.event.AssistantMessageEventStream;
@@ -19,13 +23,16 @@ import com.pi.ai.core.types.Context;
 import com.pi.ai.core.types.Message;
 import com.pi.ai.core.types.SimpleStreamOptions;
 import com.pi.ai.core.types.StopReason;
+import com.pi.ai.core.types.TextContent;
 import com.pi.ai.core.types.Tool;
 import com.pi.ai.core.types.ToolCall;
 import com.pi.ai.core.types.ToolResultMessage;
+import com.pi.ai.core.util.ToolValidator;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
@@ -500,8 +507,8 @@ public final class AgentLoop {
     /**
      * Executes tool calls from an assistant message.
      *
-     * <p><b>Stub</b>: Tasks 7.4-7.8 will implement the full logic including
-     * prepareToolCall, executePreparedToolCall, finalizeExecutedToolCall,
+     * <p><b>Stub</b>: Tasks 7.5-7.8 will implement the full logic including
+     * executePreparedToolCall, finalizeExecutedToolCall,
      * and sequential/parallel execution modes.
      * For now, returns an empty list (no tool results).
      */
@@ -512,8 +519,107 @@ public final class AgentLoop {
             CancellationSignal signal,
             EventStream<AgentEvent, List<AgentMessage>> stream) {
 
-        // Stub: return empty results. Tasks 7.4-7.8 will implement full tool execution.
+        // Stub: return empty results. Tasks 7.5-7.8 will implement full tool execution.
         return List.of();
+    }
+
+    // ── Tool preparation ─────────────────────────────────────────────────
+
+    /**
+     * Prepares a tool call for execution by performing all pre-execution checks:
+     * <ol>
+     *   <li>Find the tool by name in the context's tools list</li>
+     *   <li>Validate arguments using {@link ToolValidator#validateToolArguments}</li>
+     *   <li>Call {@link BeforeToolCallHook} if configured</li>
+     * </ol>
+     *
+     * <p>Returns {@link PrepareResult.Prepared} if all checks pass, or
+     * {@link PrepareResult.Immediate} with an error result if any check fails.
+     *
+     * <p><b>Validates: Requirements 20.1, 20.2, 20.3, 20.4, 20.5, 20.6, 20.7</b>
+     *
+     * @param context      the current agent context
+     * @param assistantMsg the assistant message that requested the tool call
+     * @param toolCall     the tool call to prepare
+     * @param config       the agent loop configuration
+     * @param signal       optional cancellation signal
+     * @return a {@link PrepareResult} indicating whether the tool is ready or was rejected
+     */
+    static PrepareResult prepareToolCall(
+            AgentContext context,
+            AgentMessage assistantMsg,
+            ToolCall toolCall,
+            AgentLoopConfig config,
+            CancellationSignal signal) {
+
+        // 1. Find tool by name (Req 20.1, 20.2)
+        AgentTool tool = null;
+        if (context.getTools() != null) {
+            for (AgentTool t : context.getTools()) {
+                if (t.name().equals(toolCall.name())) {
+                    tool = t;
+                    break;
+                }
+            }
+        }
+        if (tool == null) {
+            return new PrepareResult.Immediate(
+                    createErrorToolResult("Tool " + toolCall.name() + " not found"), true);
+        }
+
+        // 2. Validate arguments using ToolValidator (Req 20.3, 20.4)
+        try {
+            ToolValidator.validateToolArguments(tool.toTool(), toolCall);
+        } catch (IllegalArgumentException e) {
+            return new PrepareResult.Immediate(
+                    createErrorToolResult(e.getMessage()), true);
+        }
+
+        // 3. Call BeforeToolCallHook if configured (Req 20.5, 20.6)
+        if (config.getBeforeToolCall() != null) {
+            // Extract AssistantMessage from AgentMessage via MessageAdapter
+            AssistantMessage assistantMessage = null;
+            if (assistantMsg instanceof MessageAdapter adapter
+                    && adapter.message() instanceof AssistantMessage am) {
+                assistantMessage = am;
+            }
+
+            if (assistantMessage != null) {
+                BeforeToolCallContext beforeContext = new BeforeToolCallContext(
+                        assistantMessage, toolCall, toolCall.arguments(), context);
+                try {
+                    BeforeToolCallResult beforeResult =
+                            config.getBeforeToolCall().call(beforeContext, signal).join();
+                    if (beforeResult != null && Boolean.TRUE.equals(beforeResult.block())) {
+                        String reason = beforeResult.reason() != null
+                                ? beforeResult.reason()
+                                : "Tool execution was blocked";
+                        return new PrepareResult.Immediate(
+                                createErrorToolResult(reason), true);
+                    }
+                } catch (Exception e) {
+                    return new PrepareResult.Immediate(
+                            createErrorToolResult("BeforeToolCallHook failed: " + e.getMessage()), true);
+                }
+            }
+        }
+
+        // 4. All checks passed (Req 20.7)
+        return new PrepareResult.Prepared(toolCall, tool, toolCall.arguments());
+    }
+
+    /**
+     * Creates an error {@link AgentToolResult} containing a single {@link TextContent}
+     * with the given error message and an empty details map.
+     *
+     * @param message the error message
+     * @return an error tool result
+     */
+    static AgentToolResult<?> createErrorToolResult(String message) {
+        return new AgentToolResult<>(
+                List.of(new TextContent(message)),
+                Map.of()
+        );
     }
 
     // ── Helper methods ───────────────────────────────────────────────────
