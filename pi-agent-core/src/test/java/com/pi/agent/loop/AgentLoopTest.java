@@ -1,11 +1,16 @@
 package com.pi.agent.loop;
 
 import com.pi.agent.config.AgentLoopConfig;
+import com.pi.agent.config.StreamFn;
 import com.pi.agent.event.AgentEvent;
 import com.pi.agent.types.AgentContext;
 import com.pi.agent.types.AgentMessage;
+import com.pi.agent.types.MessageAdapter;
+import com.pi.ai.core.event.AssistantMessageEvent;
+import com.pi.ai.core.event.AssistantMessageEventStream;
 import com.pi.ai.core.event.EventStream;
-
+import com.pi.ai.core.types.AssistantMessage;
+import com.pi.ai.core.types.StopReason;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -42,6 +47,29 @@ class AgentLoopTest {
     }
 
     /**
+     * Creates a mock StreamFn that returns a simple AssistantMessage with STOP reason.
+     * This is needed because the real streamAssistantResponse now calls StreamFn.
+     */
+    private static StreamFn mockStreamFn() {
+        return (model, context, options) -> {
+            AssistantMessageEventStream stream = AssistantMessageEventStream.create();
+            AssistantMessage msg = AssistantMessage.builder()
+                    .content(List.of())
+                    .stopReason(StopReason.STOP)
+                    .usage(new com.pi.ai.core.types.Usage(0, 0, 0, 0, 0, null))
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+            // Push start then done events asynchronously
+            java.util.concurrent.CompletableFuture.runAsync(() -> {
+                stream.push(new AssistantMessageEvent.Start(msg));
+                stream.push(new AssistantMessageEvent.Done(StopReason.STOP, msg));
+                stream.end(msg);
+            });
+            return stream;
+        };
+    }
+
+    /**
      * Collects all events from the stream into a list.
      */
     private static List<AgentEvent> collectEvents(EventStream<AgentEvent, List<AgentMessage>> stream) {
@@ -60,7 +88,7 @@ class AgentLoopTest {
         List<AgentMessage> prompts = List.of(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, mockStreamFn());
 
         assertThat(stream).isNotNull();
         List<AgentEvent> events = collectEvents(stream);
@@ -73,7 +101,7 @@ class AgentLoopTest {
         AgentMessage prompt = stubMessage("user");
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(List.of(prompt), ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(List.of(prompt), ctx, minimalConfig(), null, mockStreamFn());
 
         // Consume all events to let the async loop complete
         collectEvents(stream);
@@ -88,7 +116,7 @@ class AgentLoopTest {
         List<AgentMessage> prompts = List.of(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
         assertThat(events.get(0)).isInstanceOf(AgentEvent.AgentStart.class);
@@ -100,7 +128,7 @@ class AgentLoopTest {
         List<AgentMessage> prompts = List.of(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
         assertThat(events.get(0)).isInstanceOf(AgentEvent.AgentStart.class);
@@ -114,11 +142,11 @@ class AgentLoopTest {
         AgentMessage p2 = stubMessage("user");
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(List.of(p1, p2), ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(List.of(p1, p2), ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
 
-        // After agent_start and turn_start, we expect message_start/end pairs
+        // After agent_start and turn_start, we expect message_start/end pairs for prompts
         assertThat(events.get(2)).isInstanceOf(AgentEvent.MessageStart.class);
         assertThat(((AgentEvent.MessageStart) events.get(2)).message()).isSameAs(p1);
         assertThat(events.get(3)).isInstanceOf(AgentEvent.MessageEnd.class);
@@ -137,7 +165,7 @@ class AgentLoopTest {
         List<AgentMessage> prompts = List.of(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
         AgentEvent lastEvent = events.get(events.size() - 1);
@@ -150,7 +178,7 @@ class AgentLoopTest {
         AgentMessage prompt = stubMessage("user");
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(List.of(prompt), ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(List.of(prompt), ctx, minimalConfig(), null, mockStreamFn());
 
         // Consume events to let the loop complete
         collectEvents(stream);
@@ -166,7 +194,7 @@ class AgentLoopTest {
         AgentMessage p2 = stubMessage("user");
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(List.of(p1, p2), ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(List.of(p1, p2), ctx, minimalConfig(), null, mockStreamFn());
 
         collectEvents(stream);
 
@@ -174,16 +202,107 @@ class AgentLoopTest {
     }
 
     @Test
-    void agentLoop_acceptsNullSignalAndStreamFn() {
+    void agentLoop_acceptsNullSignalAndStreamFn_withMockStreamFn() {
         AgentContext ctx = emptyContext();
         List<AgentMessage> prompts = List.of(stubMessage("user"));
 
-        // Should not throw
+        // Passing a mock StreamFn (null streamFn would require PiAi provider registration)
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
         assertThat(events).isNotEmpty();
+    }
+
+    // ==================== agentLoop: streamAssistantResponse integration ====================
+
+    @Test
+    void agentLoop_emitsMessageStartAndEndForAssistantMessage() {
+        AgentContext ctx = emptyContext();
+        List<AgentMessage> prompts = List.of(stubMessage("user"));
+
+        EventStream<AgentEvent, List<AgentMessage>> stream =
+                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, mockStreamFn());
+
+        List<AgentEvent> events = collectEvents(stream);
+
+        // Should have message_start and message_end for the assistant message
+        long assistantMessageStarts = events.stream()
+                .filter(e -> e instanceof AgentEvent.MessageStart ms
+                        && "assistant".equals(ms.message().role()))
+                .count();
+        long assistantMessageEnds = events.stream()
+                .filter(e -> e instanceof AgentEvent.MessageEnd me
+                        && "assistant".equals(me.message().role()))
+                .count();
+        assertThat(assistantMessageStarts).isGreaterThanOrEqualTo(1);
+        assertThat(assistantMessageEnds).isGreaterThanOrEqualTo(1);
+    }
+
+    @Test
+    void agentLoop_assistantMessageAddedToContext() {
+        AgentContext ctx = emptyContext();
+        List<AgentMessage> prompts = List.of(stubMessage("user"));
+
+        EventStream<AgentEvent, List<AgentMessage>> stream =
+                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, mockStreamFn());
+
+        collectEvents(stream);
+
+        // Context should contain the assistant message
+        boolean hasAssistant = ctx.getMessages().stream()
+                .anyMatch(m -> "assistant".equals(m.role()));
+        assertThat(hasAssistant).isTrue();
+    }
+
+    @Test
+    void agentLoop_resultContainsAssistantMessage() {
+        AgentContext ctx = emptyContext();
+        AgentMessage prompt = stubMessage("user");
+
+        EventStream<AgentEvent, List<AgentMessage>> stream =
+                AgentLoop.agentLoop(List.of(prompt), ctx, minimalConfig(), null, mockStreamFn());
+
+        collectEvents(stream);
+
+        List<AgentMessage> result = stream.result().join();
+        boolean hasAssistant = result.stream()
+                .anyMatch(m -> "assistant".equals(m.role()));
+        assertThat(hasAssistant).isTrue();
+    }
+
+    @Test
+    void agentLoop_streamFnWithErrorStopReason_terminatesImmediately() {
+        StreamFn errorStreamFn = (model, context, options) -> {
+            AssistantMessageEventStream s = AssistantMessageEventStream.create();
+            AssistantMessage msg = AssistantMessage.builder()
+                    .content(List.of())
+                    .stopReason(StopReason.ERROR)
+                    .errorMessage("test error")
+                    .usage(new com.pi.ai.core.types.Usage(0, 0, 0, 0, 0, null))
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+            java.util.concurrent.CompletableFuture.runAsync(() -> {
+                s.push(new AssistantMessageEvent.Error(StopReason.ERROR, msg));
+                s.end(msg);
+            });
+            return s;
+        };
+
+        AgentContext ctx = emptyContext();
+        List<AgentMessage> prompts = List.of(stubMessage("user"));
+
+        EventStream<AgentEvent, List<AgentMessage>> stream =
+                AgentLoop.agentLoop(prompts, ctx, minimalConfig(), null, errorStreamFn);
+
+        List<AgentEvent> events = collectEvents(stream);
+        AgentEvent lastEvent = events.get(events.size() - 1);
+        assertThat(lastEvent).isInstanceOf(AgentEvent.AgentEnd.class);
+
+        // Should have turn_end before agent_end
+        boolean hasTurnEnd = events.stream()
+                .anyMatch(e -> e instanceof AgentEvent.TurnEnd);
+        assertThat(hasTurnEnd).isTrue();
     }
 
     // ==================== agentLoopContinue: precondition checks ====================
@@ -217,7 +336,7 @@ class AgentLoopTest {
         ctx.getMessages().add(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, mockStreamFn());
 
         assertThat(stream).isNotNull();
         List<AgentEvent> events = collectEvents(stream);
@@ -230,7 +349,7 @@ class AgentLoopTest {
         ctx.getMessages().add(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
         assertThat(events.get(0)).isInstanceOf(AgentEvent.AgentStart.class);
@@ -243,13 +362,12 @@ class AgentLoopTest {
         ctx.getMessages().add(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
 
         // After agent_start and turn_start, there should be no message_start/end
-        // for the existing user message. However, the runLoop will produce a stub
-        // assistant message which does emit message_start/end.
+        // for the existing user message.
         long messageStartCount = events.stream()
                 .filter(e -> e instanceof AgentEvent.MessageStart ms
                         && "user".equals(ms.message().role()))
@@ -263,7 +381,7 @@ class AgentLoopTest {
         ctx.getMessages().add(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
         AgentEvent lastEvent = events.get(events.size() - 1);
@@ -276,11 +394,10 @@ class AgentLoopTest {
         ctx.getMessages().add(stubMessage("user"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, mockStreamFn());
 
         collectEvents(stream);
 
-        // In continue mode, runLoop produces a stub assistant message
         List<AgentMessage> result = stream.result().join();
         assertThat(result).hasSize(1);
         assertThat(result.get(0).role()).isEqualTo("assistant");
@@ -292,7 +409,7 @@ class AgentLoopTest {
         ctx.getMessages().add(stubMessage("toolResult"));
 
         EventStream<AgentEvent, List<AgentMessage>> stream =
-                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, null);
+                AgentLoop.agentLoopContinue(ctx, minimalConfig(), null, mockStreamFn());
 
         List<AgentEvent> events = collectEvents(stream);
         assertThat(events).isNotEmpty();

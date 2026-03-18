@@ -1,16 +1,25 @@
 package com.pi.agent.loop;
 
 import com.pi.agent.config.AgentLoopConfig;
+import com.pi.agent.config.ConvertToLlmFunction;
 import com.pi.agent.config.StreamFn;
 import com.pi.agent.event.AgentEvent;
 import com.pi.agent.types.AgentContext;
 import com.pi.agent.types.AgentMessage;
+import com.pi.agent.types.AgentTool;
 import com.pi.agent.types.MessageAdapter;
+import com.pi.ai.core.event.AssistantMessageEvent;
+import com.pi.ai.core.event.AssistantMessageEventStream;
 import com.pi.ai.core.event.EventStream;
+import com.pi.ai.core.stream.PiAi;
 import com.pi.ai.core.types.AssistantContentBlock;
 import com.pi.ai.core.types.AssistantMessage;
 import com.pi.ai.core.types.CancellationSignal;
+import com.pi.ai.core.types.Context;
+import com.pi.ai.core.types.Message;
+import com.pi.ai.core.types.SimpleStreamOptions;
 import com.pi.ai.core.types.StopReason;
+import com.pi.ai.core.types.Tool;
 import com.pi.ai.core.types.ToolCall;
 import com.pi.ai.core.types.ToolResultMessage;
 
@@ -18,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
 /**
  * Agent loop engine: provides {@link #agentLoop} and {@link #agentLoopContinue}
@@ -296,10 +306,17 @@ public final class AgentLoop {
     /**
      * Streams an assistant response from the LLM.
      *
-     * <p><b>Stub</b>: Task 7.3 will implement the full logic including
-     * transformContext → convertToLlm → build LLM Context → call StreamFn.
-     * For now, returns a minimal AssistantMessage with stopReason=STOP and
-     * emits message_start/message_end events.
+     * <p>Executes the following pipeline:
+     * <ol>
+     *   <li>transformContext (optional) — transforms AgentMessage list</li>
+     *   <li>convertToLlm — converts AgentMessage list to LLM Message list</li>
+     *   <li>Build LLM Context with systemPrompt, messages, and tools</li>
+     *   <li>Resolve API key (optional via getApiKey callback)</li>
+     *   <li>Call StreamFn (defaults to PiAi::streamSimple)</li>
+     *   <li>Process event stream: start/delta/done/error</li>
+     * </ol>
+     *
+     * <p><b>Validates: Requirements 17.1, 17.2, 17.3, 17.4, 17.5, 17.6, 17.7, 17.8, 17.9</b>
      */
     static AgentMessage streamAssistantResponse(
             AgentContext context,
@@ -308,21 +325,176 @@ public final class AgentLoop {
             EventStream<AgentEvent, List<AgentMessage>> stream,
             StreamFn streamFn) {
 
-        // Create a minimal stub AssistantMessage with no tool calls
-        AssistantMessage stubMsg = AssistantMessage.builder()
-                .content(List.of())
-                .stopReason(StopReason.STOP)
-                .timestamp(System.currentTimeMillis())
+        // 1. Apply context transform if configured (Req 17.1, 17.2)
+        List<AgentMessage> messages = context.getMessages();
+        if (config.getTransformContext() != null) {
+            try {
+                messages = config.getTransformContext().transform(messages, signal).join();
+            } catch (Exception e) {
+                // transformContext should not throw; fall back to original messages
+                messages = context.getMessages();
+            }
+        }
+
+        // 2. Convert to LLM messages (Req 17.3)
+        ConvertToLlmFunction convertFn = config.getConvertToLlm();
+        List<Message> llmMessages;
+        if (convertFn != null) {
+            llmMessages = convertFn.convert(messages);
+        } else {
+            // Default: filter MessageAdapter instances and unwrap them
+            llmMessages = messages.stream()
+                    .filter(MessageAdapter::isLlmMessage)
+                    .map(MessageAdapter::unwrap)
+                    .collect(Collectors.toList());
+        }
+
+        // 3. Build LLM Context (Req 17.4)
+        List<Tool> tools = null;
+        if (context.getTools() != null && !context.getTools().isEmpty()) {
+            tools = context.getTools().stream()
+                    .map(AgentTool::toTool)
+                    .collect(Collectors.toList());
+        }
+        Context llmContext = new Context(context.getSystemPrompt(), llmMessages, tools);
+
+        // 4. Resolve API key (Req 17.5)
+        SimpleStreamOptions baseOptions = config.getStreamOptions();
+        String resolvedApiKey = baseOptions.getApiKey();
+        if (config.getGetApiKey() != null && config.getModel() != null) {
+            try {
+                String dynamicKey = config.getGetApiKey().getApiKey(config.getModel().provider()).join();
+                if (dynamicKey != null) {
+                    resolvedApiKey = dynamicKey;
+                }
+            } catch (Exception e) {
+                // Fall back to static apiKey
+            }
+        }
+
+        // Build stream options with resolved apiKey and signal
+        SimpleStreamOptions effectiveOptions = SimpleStreamOptions.simpleBuilder()
+                .temperature(baseOptions.getTemperature())
+                .maxTokens(baseOptions.getMaxTokens())
+                .apiKey(resolvedApiKey)
+                .cacheRetention(baseOptions.getCacheRetention())
+                .sessionId(baseOptions.getSessionId())
+                .headers(baseOptions.getHeaders())
+                .transport(baseOptions.getTransport())
+                .maxRetryDelayMs(baseOptions.getMaxRetryDelayMs())
+                .metadata(baseOptions.getMetadata())
+                .onPayload(baseOptions.getOnPayload())
+                .signal(signal != null ? signal : baseOptions.getSignal())
+                .reasoning(baseOptions.getReasoning())
+                .thinkingBudgets(baseOptions.getThinkingBudgets())
                 .build();
 
-        AgentMessage agentMsg = MessageAdapter.wrap(stubMsg);
+        // 5. Call StreamFn (Req 12.2)
+        StreamFn fn = streamFn != null ? streamFn : PiAi::streamSimple;
+        AssistantMessageEventStream response = fn.stream(config.getModel(), llmContext, effectiveOptions);
 
-        // Add to context and emit events
-        context.getMessages().add(agentMsg);
-        stream.push(new AgentEvent.MessageStart(agentMsg));
-        stream.push(new AgentEvent.MessageEnd(agentMsg));
+        // 6. Process event stream (Req 17.6, 17.7, 17.8, 17.9)
+        AgentMessage partialAgentMsg = null;
+        boolean addedPartial = false;
 
-        return agentMsg;
+        for (AssistantMessageEvent event : response) {
+            if (event instanceof AssistantMessageEvent.Start) {
+                AssistantMessageEvent.Start start = (AssistantMessageEvent.Start) event;
+                // Req 17.6: wrap partial, add to context, emit message_start
+                partialAgentMsg = MessageAdapter.wrap(start.partial());
+                context.getMessages().add(partialAgentMsg);
+                addedPartial = true;
+                stream.push(new AgentEvent.MessageStart(partialAgentMsg));
+
+            } else if (event instanceof AssistantMessageEvent.Done) {
+                // Req 17.8: replace partial with final message
+                AssistantMessage finalMsg = response.result().join();
+                AgentMessage finalAgentMsg = MessageAdapter.wrap(finalMsg);
+                if (addedPartial) {
+                    replaceLastMessage(context, finalAgentMsg);
+                } else {
+                    context.getMessages().add(finalAgentMsg);
+                    stream.push(new AgentEvent.MessageStart(finalAgentMsg));
+                }
+                stream.push(new AgentEvent.MessageEnd(finalAgentMsg));
+                return finalAgentMsg;
+
+            } else if (event instanceof AssistantMessageEvent.Error) {
+                // Req 17.8: same handling as done
+                AssistantMessage finalMsg = response.result().join();
+                AgentMessage finalAgentMsg = MessageAdapter.wrap(finalMsg);
+                if (addedPartial) {
+                    replaceLastMessage(context, finalAgentMsg);
+                } else {
+                    context.getMessages().add(finalAgentMsg);
+                    stream.push(new AgentEvent.MessageStart(finalAgentMsg));
+                }
+                stream.push(new AgentEvent.MessageEnd(finalAgentMsg));
+                return finalAgentMsg;
+
+            } else {
+                // Req 17.7: all delta events — update context.messages and emit message_update
+                if (partialAgentMsg != null) {
+                    AssistantMessage partial = extractPartialFromEvent(event);
+                    if (partial != null) {
+                        partialAgentMsg = MessageAdapter.wrap(partial);
+                        replaceLastMessage(context, partialAgentMsg);
+                    }
+                    stream.push(new AgentEvent.MessageUpdate(partialAgentMsg, event));
+                }
+            }
+        }
+
+        // Defensive: stream ended without done/error event
+        AssistantMessage finalMsg = response.result().join();
+        AgentMessage finalAgentMsg = MessageAdapter.wrap(finalMsg);
+        if (addedPartial) {
+            replaceLastMessage(context, finalAgentMsg);
+        } else {
+            context.getMessages().add(finalAgentMsg);
+            stream.push(new AgentEvent.MessageStart(finalAgentMsg));
+        }
+        stream.push(new AgentEvent.MessageEnd(finalAgentMsg));
+        return finalAgentMsg;
+    }
+
+    /**
+     * Replaces the last message in the context's message list.
+     */
+    private static void replaceLastMessage(AgentContext context, AgentMessage message) {
+        List<AgentMessage> messages = context.getMessages();
+        if (!messages.isEmpty()) {
+            messages.set(messages.size() - 1, message);
+        }
+    }
+
+    /**
+     * Extracts the partial {@link AssistantMessage} from a delta event.
+     * Returns {@code null} if the event type is not recognized as a delta event.
+     *
+     * <p>Uses if-else instanceof chains for Java 17 compatibility.
+     */
+    private static AssistantMessage extractPartialFromEvent(AssistantMessageEvent event) {
+        if (event instanceof AssistantMessageEvent.TextStart e) {
+            return e.partial();
+        } else if (event instanceof AssistantMessageEvent.TextDelta e) {
+            return e.partial();
+        } else if (event instanceof AssistantMessageEvent.TextEnd e) {
+            return e.partial();
+        } else if (event instanceof AssistantMessageEvent.ThinkingStart e) {
+            return e.partial();
+        } else if (event instanceof AssistantMessageEvent.ThinkingDelta e) {
+            return e.partial();
+        } else if (event instanceof AssistantMessageEvent.ThinkingEnd e) {
+            return e.partial();
+        } else if (event instanceof AssistantMessageEvent.ToolCallStart e) {
+            return e.partial();
+        } else if (event instanceof AssistantMessageEvent.ToolCallDelta e) {
+            return e.partial();
+        } else if (event instanceof AssistantMessageEvent.ToolCallEnd e) {
+            return e.partial();
+        }
+        return null;
     }
 
     /**
