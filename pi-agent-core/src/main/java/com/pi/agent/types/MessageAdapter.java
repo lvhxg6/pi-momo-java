@@ -1,5 +1,7 @@
 package com.pi.agent.types;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeName;
 import com.pi.ai.core.types.Message;
 
 /**
@@ -19,11 +21,12 @@ import com.pi.ai.core.types.Message;
  *       a standard LLM {@code Message}</li>
  * </ul>
  *
- * <p><b>Validates: Requirements 8.2, 8.3, 8.4, 8.5, 38.2</b>
+ * <p><b>Validates: Requirements 8.2, 8.3, 8.4, 8.5, 38.2, 40.1</b>
  *
  * @param message the wrapped pi-ai-core {@link Message}
  */
-public record MessageAdapter(Message message) implements AgentMessage {
+@JsonTypeName("messageAdapter")
+public record MessageAdapter(@JsonProperty("message") Message message) implements AgentMessage {
 
     /**
      * Creates a {@code MessageAdapter} with a non-null message.
