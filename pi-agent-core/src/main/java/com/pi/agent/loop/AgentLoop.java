@@ -23,12 +23,14 @@ import com.pi.ai.core.types.AssistantMessage;
 import com.pi.ai.core.types.CancellationSignal;
 import com.pi.ai.core.types.Context;
 import com.pi.ai.core.types.Message;
+import com.pi.ai.core.types.Model;
 import com.pi.ai.core.types.SimpleStreamOptions;
 import com.pi.ai.core.types.StopReason;
 import com.pi.ai.core.types.TextContent;
 import com.pi.ai.core.types.Tool;
 import com.pi.ai.core.types.ToolCall;
 import com.pi.ai.core.types.ToolResultMessage;
+import com.pi.ai.core.types.Usage;
 import com.pi.ai.core.util.PiAiJson;
 import com.pi.ai.core.util.ToolValidator;
 
@@ -88,7 +90,22 @@ public final class AgentLoop {
                         prompts, context, config, stream, signal, streamFn);
                 stream.end(messages);
             } catch (Exception e) {
-                stream.end(List.of());
+                // Create error AssistantMessage and emit AgentEnd with error info
+                Model model = config.getModel();
+                AssistantMessage errorMsg = AssistantMessage.builder()
+                        .content(List.of(new TextContent("")))
+                        .api(model != null ? model.api() : null)
+                        .provider(model != null ? model.provider() : null)
+                        .model(model != null ? model.id() : null)
+                        .usage(new Usage(0, 0, 0, 0, 0, new Usage.Cost(0.0, 0.0, 0.0, 0.0, 0.0)))
+                        .stopReason(StopReason.ERROR)
+                        .errorMessage(e.getMessage())
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+                AgentMessage wrappedErrorMsg = MessageAdapter.wrap(errorMsg);
+                stream.push(new AgentEvent.MessageEnd(wrappedErrorMsg));
+                stream.push(new AgentEvent.AgentEnd(List.of(wrappedErrorMsg)));
+                stream.end(List.of(wrappedErrorMsg));
             }
         });
 

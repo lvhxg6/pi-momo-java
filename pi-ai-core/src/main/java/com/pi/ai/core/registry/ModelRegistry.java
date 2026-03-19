@@ -77,11 +77,16 @@ public final class ModelRegistry {
      *
      * <p>公式：{@code (price / 1000000) * tokens}
      *
+     * <p>如果模型没有定价信息（cost 为 null），返回零费用。
+     *
      * @param model 模型定义（包含定价信息）
      * @param usage token 用量统计
-     * @return 费用明细
+     * @return 费用明细，cost 为 null 时返回全零费用
      */
     public static Usage.Cost calculateCost(Model model, Usage usage) {
+        if (model.cost() == null) {
+            return new Usage.Cost(0.0, 0.0, 0.0, 0.0, 0.0);
+        }
         double input = (model.cost().input() / 1000000.0) * usage.input();
         double output = (model.cost().output() / 1000000.0) * usage.output();
         double cacheRead = (model.cost().cacheRead() / 1000000.0) * usage.cacheRead();
