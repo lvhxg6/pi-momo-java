@@ -264,6 +264,9 @@ public final class CodingAgentSdk {
             // Apply resolved thinking level
             session.setThinkingLevel(resolvedThinkingLevel);
 
+            // Start watching for resource changes (hot-reload)
+            effectiveResourceLoader.startWatching();
+
             return new CreateResult(session, extResult, modelFallbackMessage);
         }
     }

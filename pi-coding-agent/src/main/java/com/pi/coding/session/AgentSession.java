@@ -15,6 +15,8 @@ import com.pi.coding.model.CodingModelRegistry;
 import com.pi.coding.prompt.SystemPromptBuilder;
 import com.pi.coding.prompt.SystemPromptConfig;
 import com.pi.coding.resource.ContextFile;
+import com.pi.coding.resource.ResourceChangeEvent;
+import com.pi.coding.resource.ResourceChangeListener;
 import com.pi.coding.resource.ResourceLoader;
 import com.pi.coding.resource.Skill;
 import com.pi.coding.settings.RetrySettings;
@@ -63,6 +65,7 @@ public class AgentSession {
     // ---- Event listeners ----
     private final CopyOnWriteArrayList<Consumer<AgentSessionEvent>> listeners = new CopyOnWriteArrayList<>();
     private Runnable agentUnsubscribe;
+    private final ResourceChangeListener resourceChangeListener;
 
     // ---- Retry state ----
     private final AtomicInteger retryAttempt = new AtomicInteger(0);
@@ -106,8 +109,24 @@ public class AgentSession {
         // Subscribe to agent events
         this.agentUnsubscribe = agent.subscribe(this::handleAgentEvent);
 
+        // Register resource change listener for hot-reload
+        this.resourceChangeListener = this::handleResourceChange;
+        if (resourceLoader != null) {
+            resourceLoader.addChangeListener(resourceChangeListener);
+        }
+
         // Set up convertToLlm
         agent.getState(); // ensure initialized
+    }
+
+    /**
+     * Handle resource change events from ResourceLoader.
+     * Rebuilds the system prompt when skills or prompts change.
+     */
+    private void handleResourceChange(ResourceChangeEvent event) {
+        LOG.info("Resource change detected, rebuilding system prompt");
+        rebuildSystemPrompt();
+        emit(new ResourceChangeSessionEvent(event));
     }
 
     // =========================================================================
@@ -726,6 +745,12 @@ public class AgentSession {
             agentUnsubscribe.run();
             agentUnsubscribe = null;
         }
+        
+        // Remove resource change listener
+        if (resourceLoader != null && resourceChangeListener != null) {
+            resourceLoader.removeChangeListener(resourceChangeListener);
+        }
+        
         listeners.clear();
         abortCompaction();
         abortRetry();
@@ -771,5 +796,11 @@ public class AgentSession {
      * Wrapper that makes an AgentEvent also an AgentSessionEvent.
      */
     public record AgentEventWrapper(AgentEvent event) implements AgentSessionEvent {
+    }
+
+    /**
+     * Event emitted when resources (skills, prompts) change.
+     */
+    public record ResourceChangeSessionEvent(ResourceChangeEvent resourceEvent) implements AgentSessionEvent {
     }
 }

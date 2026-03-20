@@ -1,7 +1,5 @@
 package com.pi.coding.resource;
 
-import com.pi.coding.extension.ExtensionLoader;
-import com.pi.coding.extension.ExtensionRunner;
 import com.pi.coding.extension.LoadExtensionsResult;
 import com.pi.coding.settings.SettingsManager;
 import org.slf4j.Logger;
@@ -13,7 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.stream.Collectors;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Default implementation of ResourceLoader.
@@ -36,6 +34,10 @@ public class DefaultResourceLoader implements ResourceLoader {
     private final String cwd;
     private final String agentDir;
     private final SettingsManager settingsManager;
+    
+    // Hot-reload support
+    private final List<ResourceChangeListener> changeListeners = new CopyOnWriteArrayList<>();
+    private volatile SkillsWatcher skillsWatcher;
     
     // Extension-provided additional paths
     private List<String> additionalExtensionPaths = new ArrayList<>();
@@ -64,6 +66,16 @@ public class DefaultResourceLoader implements ResourceLoader {
         this.systemPrompt = null;
         this.appendSystemPrompt = List.of();
         this.diagnostics = List.of();
+        
+        // Initialize watcher (but don't start yet)
+        initializeWatcher();
+        
+        // Perform initial load
+        try {
+            reload().join();
+        } catch (Exception e) {
+            logger.warn("Initial resource load failed, continuing with empty resources: {}", e.getMessage());
+        }
     }
     
     @Override
@@ -71,22 +83,38 @@ public class DefaultResourceLoader implements ResourceLoader {
         return CompletableFuture.runAsync(() -> {
             List<ResourceDiagnostic> allDiagnostics = new ArrayList<>();
             
-            // 1. Load skills
-            loadSkillsInternal(allDiagnostics);
+            // Save previous results for error recovery
+            LoadSkillsResult previousSkills = this.skillsResult;
+            LoadPromptsResult previousPrompts = this.promptsResult;
             
-            // 2. Load prompt templates
-            loadPromptsInternal(allDiagnostics);
-            
-            // 3. Load context files (AGENTS.md)
-            loadContextFiles();
-            
-            // 4. Load system prompt
-            loadSystemPromptInternal();
-            
-            // 5. Load append system prompt
-            loadAppendSystemPromptInternal();
-            
-            this.diagnostics = List.copyOf(allDiagnostics);
+            try {
+                // 1. Load skills
+                loadSkillsInternal(allDiagnostics);
+                
+                // 2. Load prompt templates
+                loadPromptsInternal(allDiagnostics);
+                
+                // 3. Load context files (AGENTS.md)
+                loadContextFiles();
+                
+                // 4. Load system prompt
+                loadSystemPromptInternal();
+                
+                // 5. Load append system prompt
+                loadAppendSystemPromptInternal();
+                
+                this.diagnostics = List.copyOf(allDiagnostics);
+                
+                // Notify listeners of the change
+                notifyListeners();
+                
+            } catch (Exception e) {
+                logger.error("Error during reload, restoring previous state: {}", e.getMessage());
+                // Restore previous state on error
+                this.skillsResult = previousSkills;
+                this.promptsResult = previousPrompts;
+                throw e;
+            }
         });
     }
     
@@ -311,4 +339,103 @@ public class DefaultResourceLoader implements ResourceLoader {
         List<T> items,
         List<ResourceDiagnostic> diagnostics
     ) {}
+    
+    // ==================== Hot-Reload Support ====================
+    
+    @Override
+    public void addChangeListener(ResourceChangeListener listener) {
+        if (listener != null) {
+            changeListeners.add(listener);
+            logger.debug("Added resource change listener, total: {}", changeListeners.size());
+        }
+    }
+    
+    @Override
+    public void removeChangeListener(ResourceChangeListener listener) {
+        if (listener != null) {
+            changeListeners.remove(listener);
+            logger.debug("Removed resource change listener, total: {}", changeListeners.size());
+        }
+    }
+    
+    @Override
+    public void startWatching() {
+        if (skillsWatcher != null) {
+            skillsWatcher.start();
+            logger.info("Started watching for resource changes");
+        }
+    }
+    
+    @Override
+    public void stopWatching() {
+        if (skillsWatcher != null) {
+            skillsWatcher.stop();
+            logger.info("Stopped watching for resource changes");
+        }
+    }
+    
+    @Override
+    public void dispose() {
+        stopWatching();
+        changeListeners.clear();
+        logger.info("Disposed DefaultResourceLoader");
+    }
+    
+    /**
+     * Initialize the SkillsWatcher for file monitoring.
+     */
+    private void initializeWatcher() {
+        try {
+            SkillsWatcherConfig config = new SkillsWatcherConfig(
+                agentDir,
+                cwd,
+                SkillsWatcherConfig.DEFAULT_DEBOUNCE_DELAY_MS,
+                this::handleFileChange
+            );
+            this.skillsWatcher = new SkillsWatcher(config);
+            logger.debug("Initialized SkillsWatcher for agentDir={}, cwd={}", agentDir, cwd);
+        } catch (Exception e) {
+            logger.warn("Failed to initialize SkillsWatcher: {}", e.getMessage());
+            this.skillsWatcher = null;
+        }
+    }
+    
+    /**
+     * Handle file change events from SkillsWatcher.
+     */
+    private void handleFileChange() {
+        logger.debug("File change detected, reloading resources...");
+        reload().whenComplete((result, error) -> {
+            if (error != null) {
+                logger.error("Failed to reload resources after file change: {}", error.getMessage());
+            } else {
+                logger.info("Resources reloaded successfully after file change");
+            }
+        });
+    }
+    
+    /**
+     * Notify all registered listeners of a resource change.
+     */
+    private void notifyListeners() {
+        if (changeListeners.isEmpty()) {
+            return;
+        }
+        
+        ResourceChangeEvent event = ResourceChangeEvent.of(
+            skillsResult,
+            promptsResult,
+            diagnostics
+        );
+        
+        for (ResourceChangeListener listener : changeListeners) {
+            try {
+                listener.onResourceChanged(event);
+            } catch (Exception e) {
+                logger.warn("Error notifying resource change listener: {}", e.getMessage());
+            }
+        }
+        
+        logger.debug("Notified {} listeners of resource change", changeListeners.size());
+    }
 }
